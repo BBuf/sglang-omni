@@ -32,6 +32,8 @@ import multiprocessing as mp
 import os
 import time
 
+from sglang_omni.models.ming_omni.runtime_flags import ming_should_disable_custom_all_reduce
+
 logging.basicConfig(
     level=os.environ.get("LOGLEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -102,7 +104,8 @@ async def main_async(args: argparse.Namespace) -> None:
     overrides = {}
     if args.tp_size > 1:
         overrides["tp_size"] = args.tp_size
-        overrides["disable_custom_all_reduce"] = True
+        if ming_should_disable_custom_all_reduce(int(args.tp_size)):
+            overrides["disable_custom_all_reduce"] = True
     if args.cpu_offload_gb:
         overrides["cpu_offload_gb"] = args.cpu_offload_gb
 

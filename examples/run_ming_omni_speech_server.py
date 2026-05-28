@@ -34,6 +34,8 @@ import multiprocessing as mp
 import os
 from typing import Any
 
+from sglang_omni.models.ming_omni.runtime_flags import ming_should_disable_custom_all_reduce
+
 logging.basicConfig(
     level=os.environ.get("LOGLEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -201,7 +203,8 @@ def _launch_speech_server(args: argparse.Namespace) -> None:
 
     server_arg_updates: dict[str, object] = {}
     if args.tp_size and args.tp_size > 1:
-        server_arg_updates["disable_custom_all_reduce"] = True
+        if ming_should_disable_custom_all_reduce(int(args.tp_size)):
+            server_arg_updates["disable_custom_all_reduce"] = True
     if args.mem_fraction_static is not None:
         server_arg_updates["mem_fraction_static"] = args.mem_fraction_static
     if getattr(args, "cpu_offload_gb", None) is not None:

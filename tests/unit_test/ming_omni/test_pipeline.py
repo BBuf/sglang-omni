@@ -92,6 +92,9 @@ def test_ming_speech_launcher_exposes_tp_size_arg(monkeypatch) -> None:
 
 
 def test_ming_speech_launcher_places_thinker_tp_and_talker(monkeypatch) -> None:
+    # Default behavior (env opt-in unset): the speech launcher must set
+    # disable_custom_all_reduce=True at tp_size > 1.
+    monkeypatch.delenv("SGLANG_OMNI_MING_CUSTOM_ALL_REDUCE", raising=False)
     from examples.run_ming_omni_speech_server import _launch_speech_server
 
     captured: dict[str, object] = {}
@@ -129,6 +132,45 @@ def test_ming_speech_launcher_places_thinker_tp_and_talker(monkeypatch) -> None:
     assert thinker.gpu == [0, 1, 2, 3]
     assert talker.gpu == 4
     assert overrides["disable_custom_all_reduce"] is True
+    assert overrides["mem_fraction_static"] == 0.8
+
+
+def test_ming_speech_launcher_omits_disable_custom_all_reduce_when_env_opt_in(monkeypatch) -> None:
+    # Opt-in (SGLANG_OMNI_MING_CUSTOM_ALL_REDUCE=1): the speech launcher must
+    # NOT set disable_custom_all_reduce, so SGLang's own selection logic picks
+    # the custom path when eligible and falls back to NCCL otherwise.
+    monkeypatch.setenv("SGLANG_OMNI_MING_CUSTOM_ALL_REDUCE", "1")
+    from examples.run_ming_omni_speech_server import _launch_speech_server
+
+    captured: dict[str, object] = {}
+    serve_module = ModuleType("sglang_omni.serve")
+
+    def fake_launch_server(config, **kwargs):
+        captured["config"] = config
+        captured["kwargs"] = kwargs
+
+    serve_module.launch_server = fake_launch_server
+    monkeypatch.setitem(sys.modules, "sglang_omni.serve", serve_module)
+
+    args = SimpleNamespace(
+        model_path="dummy",
+        relay_backend="shm",
+        tp_size=4,
+        gpu_thinker=0,
+        gpu_talker=4,
+        voice="DB30",
+        mem_fraction_static=0.8,
+        host="127.0.0.1",
+        port=8000,
+        model_name="ming-omni",
+    )
+
+    _launch_speech_server(args)
+
+    stages = {stage.name: stage for stage in captured["config"].stages}
+    overrides = stages["thinker"].factory_args["server_args_overrides"]
+
+    assert "disable_custom_all_reduce" not in overrides
     assert overrides["mem_fraction_static"] == 0.8
 
 

@@ -27,6 +27,8 @@ import multiprocessing as mp
 import os
 from typing import Any
 
+from sglang_omni.models.ming_omni.runtime_flags import ming_should_disable_custom_all_reduce
+
 logging.basicConfig(
     level=os.environ.get("LOGLEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -200,7 +202,8 @@ def _launch_text_server(args: argparse.Namespace) -> None:
         thinker.tp_size = tp_size
         thinker.parallelism = thinker.parallelism.model_copy(update={"tp": tp_size})
         thinker.gpu = list(range(tp_size))
-        server_arg_updates["disable_custom_all_reduce"] = True
+        if ming_should_disable_custom_all_reduce(tp_size):
+            server_arg_updates["disable_custom_all_reduce"] = True
     if args.gpu_audio_encoder is not None:
         _set_stage_gpu(config, "audio_encoder", args.gpu_audio_encoder)
     if args.gpu_image_encoder is not None:
