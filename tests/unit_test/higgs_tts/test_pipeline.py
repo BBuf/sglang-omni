@@ -2,10 +2,13 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from sglang_omni.models.higgs_tts import stages
+from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
+from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.models.higgs_tts.utils import EOC_ID
 
 
@@ -75,6 +78,222 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     assert captured["overrides"]["cuda_graph_max_bs"] == 32
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["adapter_kwargs"] == {"max_new_tokens_cap": 2048}
+
+
+def test_higgs_reference_cache_key_round_trip() -> None:
+    state = HiggsTtsState(reference_cache_key="path:/tmp/ref.wav")
+
+    restored = HiggsTtsState.from_dict(state.to_dict())
+
+    assert restored.reference_cache_key == "path:/tmp/ref.wav"
+
+
+def test_higgs_audio_encoder_uses_guarded_reference_code_cache(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_HIGGS_REF_CODE_CACHE", "1")
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(
+        stages.Tokenizer,
+        "from_file",
+        lambda _path: object(),
+    )
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+
+    class FakeAdapter:
+        def __init__(self, _tokenizer) -> None:
+            pass
+
+        def build_prompt(
+            self, text: str, *, num_ref_tokens: int, reference_text: str | None
+        ) -> list[int]:
+            return [len(text), num_ref_tokens, len(reference_text or "")]
+
+    class FakeCodec:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def encode_reference(self, waveform, sample_rate: int) -> torch.Tensor:
+            self.calls += 1
+            return torch.tensor([[11, 12], [21, 22]], dtype=torch.long)
+
+    fake_codec = FakeCodec()
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", FakeAdapter)
+    monkeypatch.setattr(stages, "get_or_load_codec", lambda *args, **kwargs: fake_codec)
+
+    scheduler = stages.create_audio_encoder_executor(
+        "ckpt",
+        device="cuda:0",
+        num_codebooks=2,
+    )
+    encode = scheduler._fn
+
+    def make_payload(request_id: str) -> StagePayload:
+        state = HiggsTtsState(
+            reference_waveform=torch.zeros(1, 1, 16),
+            reference_cache_key="path:/tmp/ref.wav",
+            target_text="hello",
+            reference_text="speaker",
+            num_codebooks=2,
+        )
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(inputs={}),
+            data=state.to_dict(),
+        )
+
+    first = encode(make_payload("first"))
+    second = encode(make_payload("second"))
+
+    assert fake_codec.calls == 1
+    assert first.data["reference_codes_delayed"] == second.data[
+        "reference_codes_delayed"
+    ]
+    assert first.data["prompt_token_ids"] == [5, 3, 7]
+    assert second.data["prompt_token_ids"] == [5, 3, 7]
+    assert "reference_waveform" not in second.data
+    assert "reference_cache_key" not in second.data
+
+
+def test_higgs_audio_encoder_cache_is_env_guarded(monkeypatch) -> None:
+    monkeypatch.delenv("SGLANG_OMNI_HIGGS_REF_CODE_CACHE", raising=False)
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages.Tokenizer, "from_file", lambda _path: object())
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+    monkeypatch.setattr(
+        stages,
+        "HiggsTokenizerAdapter",
+        lambda _tokenizer: SimpleNamespace(
+            build_prompt=lambda text, *, num_ref_tokens, reference_text: [
+                num_ref_tokens
+            ]
+        ),
+    )
+
+    class FakeCodec:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def encode_reference(self, waveform, sample_rate: int) -> torch.Tensor:
+            self.calls += 1
+            return torch.tensor([[self.calls, 2]], dtype=torch.long)
+
+    fake_codec = FakeCodec()
+    monkeypatch.setattr(stages, "get_or_load_codec", lambda *args, **kwargs: fake_codec)
+
+    scheduler = stages.create_audio_encoder_executor(
+        "ckpt",
+        device="cuda:0",
+        num_codebooks=2,
+    )
+    encode = scheduler._fn
+    def make_payload(request_id: str) -> StagePayload:
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(inputs={}),
+            data=HiggsTtsState(
+                reference_waveform=torch.zeros(1, 1, 16),
+                reference_cache_key="path:/tmp/ref.wav",
+                num_codebooks=2,
+            ).to_dict(),
+        )
+
+    encode(make_payload("first"))
+    encode(make_payload("second"))
+
+    assert fake_codec.calls == 2
+
+
+def test_higgs_preprocessing_uses_guarded_waveform_cache(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_HIGGS_REF_CODE_CACHE", "1")
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages.Tokenizer, "from_file", lambda _path: object())
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tokenizer: object())
+
+    load_calls = 0
+
+    def fake_load_audio_to_24k(reference_audio):
+        nonlocal load_calls
+        load_calls += 1
+        return np.zeros(16, dtype=np.float32), 24000
+
+    monkeypatch.setattr(stages, "load_audio_to_24k", fake_load_audio_to_24k)
+
+    scheduler = stages.create_preprocessing_executor("ckpt", num_codebooks=2)
+    preprocess = scheduler._fn
+
+    def make_payload(request_id: str) -> StagePayload:
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(
+                inputs={
+                    "text": "hello",
+                    "references": [
+                        {"audio_path": "/tmp/ref.wav", "text": "speaker"}
+                    ],
+                },
+                params={},
+            ),
+            data={},
+        )
+
+    first = preprocess(make_payload("first"))
+    second = preprocess(make_payload("second"))
+    first_state = HiggsTtsState.from_dict(first.data)
+    second_state = HiggsTtsState.from_dict(second.data)
+
+    assert load_calls == 1
+    assert first_state.reference_cache_key == second_state.reference_cache_key
+    assert torch.equal(first_state.reference_waveform, second_state.reference_waveform)
+    assert first_state.reference_waveform.data_ptr() != second_state.reference_waveform.data_ptr()
+
+
+def test_higgs_preprocessing_waveform_cache_is_env_guarded(monkeypatch) -> None:
+    monkeypatch.delenv("SGLANG_OMNI_HIGGS_REF_CODE_CACHE", raising=False)
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages.Tokenizer, "from_file", lambda _path: object())
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tokenizer: object())
+
+    load_calls = 0
+
+    def fake_load_audio_to_24k(reference_audio):
+        nonlocal load_calls
+        load_calls += 1
+        return np.zeros(16, dtype=np.float32), 24000
+
+    monkeypatch.setattr(stages, "load_audio_to_24k", fake_load_audio_to_24k)
+
+    scheduler = stages.create_preprocessing_executor("ckpt", num_codebooks=2)
+
+    def make_payload(request_id: str) -> StagePayload:
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(
+                inputs={"text": "hello", "reference_audio": "/tmp/ref.wav"}
+            ),
+            data={},
+        )
+
+    scheduler._fn(make_payload("first"))
+    scheduler._fn(make_payload("second"))
+
+    assert load_calls == 2
 
 
 def test_higgs_model_runner_marks_sampler_finish() -> None:
